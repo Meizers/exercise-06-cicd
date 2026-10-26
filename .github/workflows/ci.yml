@@ -1,6 +1,76 @@
-# TODO: CI/CD pipeline
-# Steps required:
-# 1. Checkout code
-# 2. Build Docker image
-# 3. Run tests (pytest)
-# 4. Push image to ghcr.io/${{ github.repository }}
+name: CI/CD
+
+# Gitleaks, build and tests on every push to main and every pull request. Pushes to
+# main also publish the image to ghcr.io, tagged with the commit SHA and latest.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  gitleaks:
+    name: Secret scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      # Fails the pipeline if a secret shows up in the code or anywhere in the history.
+      - name: Scan for secrets with gitleaks
+        run: |
+          curl -sSfL https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz \
+            | tar -xz gitleaks
+          ./gitleaks git --redact -v .
+
+  build-test-push:
+    name: Build, test and push
+    runs-on: ubuntu-latest
+    needs: gitleaks
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: write   # GHCR with the job's ephemeral GITHUB_TOKEN, no stored credentials
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: docker build -t node-registry .
+
+      # --wait blocks until db and api report healthy, so a broken image fails here.
+      - name: Start api + db
+        run: |
+          cp .env.example .env
+          docker compose up -d --wait --wait-timeout 120
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - name: Run tests (pytest)
+        run: |
+          pip install pytest requests pyyaml
+          pytest tests/ -v --tb=short
+
+      - name: Show logs and stop the stack
+        if: always()
+        run: |
+          docker compose logs --tail=50
+          docker compose down -v
+
+      - name: Push image to ghcr.io
+        if: github.event_name == 'push'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          echo "$GITHUB_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          docker tag node-registry "$image:$GITHUB_SHA"
+          docker tag node-registry "$image:latest"
+          docker push "$image:$GITHUB_SHA"
+          docker push "$image:latest"
+          docker logout ghcr.io
